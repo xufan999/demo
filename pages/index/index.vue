@@ -195,29 +195,34 @@ export default {
     },
     attachCameraStream() {
       const refs = [this.$refs.cameraPrepare, this.$refs.cameraStage2];
+
       refs.forEach((ref) => {
         if (!ref || !this.cameraStream) return;
 
+        // ⭐ 关键：一定要找到真实 video
+        let videoEl = ref.$el || ref;
+
+        if (videoEl.tagName !== 'VIDEO') {
+          videoEl = videoEl.querySelector('video');
+        }
+
+        if (!videoEl) {
+          console.warn('没找到 video 元素');
+          return;
+        }
+
         try {
-          ref.srcObject = this.cameraStream;
-          setTimeout(() => {
-            ref.muted = true;
-            ref.setAttribute('playsinline', true);
+          videoEl.srcObject = this.cameraStream;
 
-            const playPromise = ref.play();
-            if (playPromise) {
-              playPromise.catch(() => {
-                console.warn('自动播放失败，需要用户交互');
-              });
-            }
-          }, 100);
-          if (typeof ref.play === 'function') {
-            const res = ref.play();
+          videoEl.muted = true;
+          videoEl.setAttribute('playsinline', true);
+          videoEl.setAttribute('webkit-playsinline', true);
 
-            // ✅ 兼容 Promise / 非 Promise
-            if (res && typeof res.then === 'function') {
-              res.catch(() => {});
-            }
+          const playPromise = videoEl.play();
+          if (playPromise) {
+            playPromise.catch(() => {
+              console.warn('需要用户点击触发播放');
+            });
           }
         } catch (err) {
           console.warn('挂载摄像头流失败', err);
@@ -438,7 +443,7 @@ export default {
   height: 100%;
   object-fit: cover;
   background: #000;
-  z-index: 999;
+  z-index: 1;
 }
 
 .prepare-layer {
@@ -614,7 +619,7 @@ export default {
   right: 20px;
   width: 120px;
   height: 160px;
-  z-index: 999;
+  z-index: 10;
 }
 
 .camera-small {

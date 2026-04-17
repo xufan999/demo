@@ -89,7 +89,7 @@
             <view class="count-number">{{ prepareCount }}</view>
             <view class="count-text">请保证全身出现在手机屏幕中</view>
           </view>
-          <view class="skip-btn" @click="goStage2">跳过</view>
+          <view class="skip-btn" @click="goStage2">跳过1</view>
         </view>
       </view>
     </view>
@@ -97,19 +97,20 @@
 </template>
 
 <script>
+import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 export default {
-  props: {
-    uid: {
-      type: String,
-      default: '',
-    },
-    initialTasks: {
-      type: Array,
-      default() {
-        return [];
-      },
-    },
-  },
+  // props: {
+  //   uid: {
+  //     type: String,
+  //     default: '',
+  //   },
+  //   initialTasks: {
+  //     type: Array,
+  //     default() {
+  //       return [];
+  //     },
+  //   },
+  // },
   data() {
     return {
       stage: 1,
@@ -135,6 +136,18 @@ export default {
       cameraStream: null,
       facingMode: 'user',
       token: '',
+      poseFrames: [], // 收集所有帧
+      lastDetectTime: 0, // 控制15fps
+      detectInterval: 66,
+      poseReady: false,
+      hasSentNew: false,
+      feedbackTimer: null,
+      lastApiTime: 0,
+      hasFinished: false,
+      uid: '',
+      audioPlayer: null,
+      isAudioProcessing: false,
+      payBool: false,
     };
   },
   computed: {
@@ -147,23 +160,322 @@ export default {
     },
   },
   mounted() {
-    this.taskList = Array.isArray(this.initialTasks) ? this.initialTasks : [];
+    console.log('2222');
+    const query = this.getQuery();
+    console.log(query, '1');
+    this.uid = query.uid || '';
+    this.token = query.token || '';
+    // this.token =
+    //   'MT eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxNTczMjY5OTQxNTkzODMzNDc4LCJleHAiOjE4MDIyNDE4MTcsInYiOjF9.8b1g-UQEjO2rEzaKHIu9nRz9A17Bnwg2Mn3bPzTQg8I';
+    if (query.item) {
+      try {
+        this.taskList = JSON.parse(decodeURIComponent(query.item));
+      } catch (e) {
+        console.warn('item 解析失败', e);
+        this.taskList = [];
+      }
+    } else if (this.uid) {
+      // ✅ 没有 item，用 uid 调接口
+      this.fetchTaskList(this.uid);
+    } else {
+      this.taskList = [];
+    }
+    this.payBool = query.payBool === 'true';
+    if (this.token) {
+      localStorage.setItem('token', this.token);
+    }
+    this.audioPlayer = new Audio();
+    this.audioPlayer.crossOrigin = 'anonymous';
+    document.addEventListener(
+      'click',
+      () => {
+        // ✅ 用真实音频预加载一次
+        this.audioPlayer.src =
+          'data:audio/mp3;base64,//uQZAAAAAAAAAAAAAAAAAAAA...'; // 空音频
+        this.audioPlayer.play().catch(() => {});
+      },
+      { once: true },
+    );
+    // ⚠️ 这里再初始化逻辑
     this.initCurrentTask();
-    this.startCamera();
     this.startPrepare();
     this.startTrainTimer();
-    this.token = localStorage.getItem('token');
+
+    this.initPose().then(() => {
+      this.startCamera();
+    });
   },
   beforeDestroy() {
     this.clearAllTimers();
     this.stopCamera();
   },
   methods: {
+    async fetchTaskList(uid) {
+      try {
+        const res = await uni.request({
+          url: 'https://ailmjl.maitianlife.com/api/exercise_plan/today/',
+          method: 'POST', // 或 POST
+          data: { plan_id: uid },
+          header: {
+            Authorization: this.token,
+          },
+        });
+        if (res.data.code === 0) {
+          this.taskList = res.data.data.day_tasks || [];
+
+          // ✅ 拿到数据后初始化任务
+          this.initCurrentTask();
+        } else {
+          this.taskList = [];
+        }
+      } catch (err) {
+        console.error('获取任务失败', err);
+        this.taskList = [];
+      }
+    },
+    getQuery() {
+      const search = window.location.search || '';
+      const query = {};
+      search
+        .replace(/^\?/, '')
+        .split('&')
+        .forEach((item) => {
+          if (!item) return;
+          const [key, val] = item.split('=');
+          query[key] = decodeURIComponent(val || '');
+        });
+      return query;
+    },
+    async initPose() {
+      const vision = await FilesetResolver.forVisionTasks('/static/wasm');
+      this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+      });
+
+      this.poseReady = true;
+    },
+    startDetect() {
+      let video = this.$refs.cameraStage2;
+
+      // ⭐ 获取真实 video
+      video = video?.$el || video;
+      if (video && video.tagName !== 'VIDEO') {
+        video = video.querySelector('video');
+      }
+
+      const run = () => {
+        if (!this.poseReady) {
+          requestAnimationFrame(run);
+          return;
+        }
+
+        if (!video) {
+          requestAnimationFrame(run);
+          return;
+        }
+
+        // ✅ 必须 ready >= 4
+        if (video.readyState < 4) {
+          requestAnimationFrame(run);
+          return;
+        }
+
+        // ✅ 必须有尺寸
+        if (video.videoWidth === 0 || video.videoHeight === 0) {
+          requestAnimationFrame(run);
+          return;
+        }
+
+        const now = performance.now();
+
+        if (now - this.lastDetectTime >= this.detectInterval) {
+          this.lastDetectTime = now;
+
+          try {
+            const result = this.poseLandmarker.detectForVideo(video, now);
+
+            if (result.landmarks?.length) {
+              const frame = this.convertFrame(result.landmarks[0]);
+              this.poseFrames.push(frame);
+              // ✅ 只保留最近150帧（10秒 * 15fps）
+              if (this.poseFrames.length > 150) {
+                this.poseFrames.shift();
+              }
+            }
+          } catch (err) {
+            console.warn('detect 出错', err);
+          }
+        }
+
+        requestAnimationFrame(run);
+      };
+
+      run();
+    },
+    unlockAudio() {
+      const audio = new Audio();
+      audio.src = ''; // 空也行
+      audio.play().catch(() => {});
+    },
+    convertFrame(landmarks) {
+      const map = {
+        nose: 0,
+        left_shoulder: 11,
+        right_shoulder: 12,
+        left_elbow: 13,
+        right_elbow: 14,
+        left_wrist: 15,
+        right_wrist: 16,
+        left_hip: 23,
+        right_hip: 24,
+        left_knee: 25,
+        right_knee: 26,
+        left_ankle: 27,
+        right_ankle: 28,
+        left_heel: 29,
+        right_heel: 30,
+      };
+
+      const frame = {};
+
+      Object.keys(map).forEach((key) => {
+        const i = map[key];
+        const p = landmarks[i];
+
+        frame[key] = {
+          x: p.x,
+          y: p.y,
+          z: p.z,
+          visibility: p.visibility || 0,
+        };
+      });
+
+      return frame;
+    },
+    async callNewApi() {
+      if (!this.payBool) return;
+      if (!this.poseFrames.length) return;
+      if (this.hasSentNew) return; // ✅ 锁
+
+      this.hasSentNew = true;
+      const payload = {
+        frames: this.poseFrames,
+        meta: {
+          fps: 15,
+          frame_count: this.poseFrames.length,
+          duration_ms: Math.floor(this.poseFrames.length * 66),
+        },
+      };
+      const videoId =
+        this.currentTask?.video?.uid || this.currentTask?.uid || '';
+      try {
+        const res = await uni.request({
+          url: 'https://ailmjl.maitianlife.com/api/user_pose_assessment/new/',
+          method: 'POST',
+          header: {
+            Authorization: this.token,
+            'Content-Type': 'application/json',
+          },
+          data: {
+            video_id: videoId,
+            // video_id: 'eXN1EaWnAjYwQ7Mek1RV',
+            input_payload: payload,
+          },
+        });
+
+        if (res.data.code === 0) {
+          const uid = res.data.data.uid;
+
+          // ✅ 开始轮询 feedback
+          this.startFeedbackPolling(uid);
+        }
+      } catch (err) {
+        console.error('new接口失败', err);
+      }
+    },
+    async startFeedbackPolling(uid) {
+      this.isAudioProcessing = true;
+
+      if (this.feedbackTimer) {
+        clearInterval(this.feedbackTimer);
+        this.feedbackTimer = null;
+      }
+
+      this.feedbackTimer = setInterval(async () => {
+        try {
+          const res = await uni.request({
+            url: 'https://ailmjl.maitianlife.com/api/user_pose_assessment/feedback/',
+            method: 'POST',
+            header: {
+              Authorization: this.token,
+              'Content-Type': 'application/json',
+            },
+            data: { uid },
+          });
+
+          const data = res.data?.data;
+
+          if (data?.feedback || data?.feedback_audio) {
+            clearInterval(this.feedbackTimer);
+            this.feedbackTimer = null;
+
+            console.log('拿到反馈:', data);
+
+            // ⭐ 关键：等语音播放完
+            if (data.feedback_audio) {
+              await this.playAudio(data.feedback_audio);
+            }
+
+            if (data.feedback) {
+              this.currentFeedback = data.feedback;
+            }
+
+            // ⭐ 关键：这里才算彻底结束
+            this.isAudioProcessing = false;
+          }
+        } catch (err) {
+          console.error('feedback轮询失败', err);
+        }
+      }, 3000);
+    },
+    playAudio(url) {
+      return new Promise((resolve) => {
+        if (!url || !this.audioPlayer) {
+          resolve();
+          return;
+        }
+
+        this.audioPlayer.src = url;
+
+        this.audioPlayer.onended = () => {
+          console.log('音频播放结束');
+          resolve(); // ✅ 播放完才继续
+        };
+
+        this.audioPlayer.onerror = () => {
+          console.warn('音频失败，直接继续');
+          resolve(); // ✅ 出错也继续
+        };
+
+        this.audioPlayer.play().catch(() => {
+          console.warn('播放失败');
+          resolve(); // ✅ 被拦截也继续
+        });
+      });
+    },
     clearAllTimers() {
       clearInterval(this.prepareTimer);
       clearInterval(this.middleTimer);
       clearInterval(this.trainTimer);
       clearInterval(this.titleTimer);
+      // ✅ 新增
+      clearInterval(this.feedbackTimer);
+      this.feedbackTimer = null;
     },
     async startCamera() {
       if (
@@ -225,6 +537,7 @@ export default {
           videoEl.setAttribute('webkit-playsinline', true);
 
           const playPromise = videoEl.play();
+          this.startDetect();
           if (playPromise) {
             playPromise.catch(() => {
               console.warn('需要用户点击触发播放');
@@ -248,9 +561,9 @@ export default {
     },
     initCurrentTask() {
       this.currentTask = this.taskList[this.currentIndex] || {};
-      // this.videoUrl = this.currentTask?.video?.video_url || '';
-      this.videoUrl =
-        'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4';
+      this.videoUrl = this.currentTask?.video?.video_url || '';
+      // this.videoUrl =
+      //   'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4';
       this.currentTitle =
         this.currentTask.title || this.currentTask?.video?.title || '';
       if (!this.videoUrl) {
@@ -319,11 +632,12 @@ export default {
     onTimeUpdate(e) {
       if (this.stage !== 2) return;
       this.currentTime = e.detail.currentTime;
+      if (this.currentTime - this.lastApiTime >= 5) {
+        this.lastApiTime = this.currentTime;
+        this.callNewApi();
+      }
       const duration = e.detail.duration;
       if (!duration) return;
-      if (this.currentTime >= duration - 0.3) {
-        this.videoEnded();
-      }
     },
     startMiddleCount(callback) {
       this.middleCount = 10;
@@ -339,13 +653,19 @@ export default {
       }, 1000);
     },
     async videoEnded() {
-      if (this.stage !== 2 || this.isHandlingVideoEnd) return;
+      if (this.stage !== 2 || this.isHandlingVideoEnd || this.hasFinished)
+        return;
+
       this.isHandlingVideoEnd = true;
-      this.isPlaying = false;
+
       const isLast = this.currentIndex >= this.taskList.length - 1;
+
       try {
         if (isLast) {
-          this.finishTrain();
+          this.hasFinished = true; // ✅ 锁死
+          setTimeout(() => {
+            this.finishTrain();
+          }, 1000);
         } else {
           this.startMiddleCount(() => {
             this.playNextTask();
@@ -356,9 +676,13 @@ export default {
       }
     },
     async playNextTask() {
+      this.poseFrames = []; // ✅ 清空
+      this.hasSentNew = false;
       this.currentIndex++;
       if (this.currentIndex >= this.taskList.length) {
-        this.finishTrain();
+        setTimeout(() => {
+          this.finishTrain();
+        }, 500);
         return;
       }
       this.middleCount = 0;
@@ -369,29 +693,61 @@ export default {
         this.showTitleBeforeVideo();
       }
     },
-    finishTrain() {
-      uni
-        .request({
-          url: 'https://xnln.frp.mtkjsoft.com/api/exercise_plan/checkin/',
+    async finishTrain() {
+      try {
+        await uni.request({
+          url: 'https://ailmjl.maitianlife.com/api/exercise_plan/checkin/',
           header: {
             Authorization: this.token,
           },
-        })
-        .finally(() => {
-          uni.showModal({
-            title: '训练完成',
-            content: '恭喜你完成本次训练',
-            confirmText: '返回',
-            cancelText: '再练一次',
-            success: (res) => {
-              if (res.confirm) {
-                this.exit();
-              } else if (res.cancel) {
-                this.restartTrain();
-              }
-            },
-          });
         });
+      } catch (e) {}
+      // ❗ 非会员：直接弹，不等语音
+      if (!this.payBool) {
+        uni.showModal({
+          title: '提示',
+          content: '运动视频已播放完成，如需获取数据分析，请开通会员',
+          confirmText: '返回',
+          cancelText: '确认开通',
+          success: (res) => {
+            if (res.confirm) {
+              this.exit();
+            } else if (res.cancel) {
+              this.goPay(); // 建议跳支付页
+            }
+          },
+        });
+        return;
+      }
+      // ⭐ 等语音+轮询完全结束
+      await this.waitAllAudioDone();
+      uni.showModal({
+        title: '训练完成',
+        content: '恭喜你完成本次训练',
+        confirmText: '返回',
+        cancelText: '再练一次',
+        success: (res) => {
+          if (res.confirm) {
+            this.exit();
+          } else if (res.cancel) {
+            this.restartTrain();
+          }
+        },
+      });
+    },
+    waitAllAudioDone() {
+      return new Promise((resolve) => {
+        const check = () => {
+          // ✅ 条件：没有在处理语音 + 没有轮询
+          if (!this.isAudioProcessing && !this.feedbackTimer) {
+            resolve();
+          } else {
+            setTimeout(check, 200); // 轮询检查
+          }
+        };
+
+        check();
+      });
     },
     restartTrain() {
       this.currentIndex = 0;
@@ -426,9 +782,41 @@ export default {
     exit() {
       this.clearAllTimers();
       this.stopCamera();
-      uni.reLaunch({
-        url: `/subpkg/member/1?uid=${this.uid}`,
-      });
+      if (window.wx && wx.miniProgram) {
+        wx.miniProgram.getEnv((res) => {
+          if (res.miniprogram) {
+            wx.miniProgram.reLaunch({
+              url: '/pages/index/index',
+              fail: () => {
+                wx.miniProgram.switchTab({
+                  url: '/pages/index/index',
+                });
+              },
+            });
+          } else {
+            window.location.href = '/';
+          }
+        });
+      } else {
+        window.location.href = '/';
+      }
+    },
+    goPay() {
+      this.clearAllTimers();
+      this.stopCamera();
+      // ⭐ 小程序环境
+      if (window.wx && wx.miniProgram) {
+        wx.miniProgram.navigateTo({
+          url: '/subpkg/member/index',
+          fail: () => {
+            // 👉 兜底（极少数情况）
+            wx.miniProgram.reLaunch({
+              url: '/pages/index/index',
+            });
+          },
+        });
+        return;
+      }
     },
   },
 };

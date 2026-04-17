@@ -38,6 +38,12 @@
           muted
           playsinline
           webkit-playsinline
+          x5-playsinline
+          x5-video-player-type="h5"
+          x5-video-player-fullscreen="false"
+          controls="false"
+          controlslist="nodownload nofullscreen noremoteplayback"
+          disablePictureInPicture
         ></video>
         <view class="switch-btn" @click="switchCamera">
           <image src="/static/jingtoufanzhuan.png"></image>
@@ -83,7 +89,7 @@
             <view class="count-number">{{ prepareCount }}</view>
             <view class="count-text">请保证全身出现在手机屏幕中</view>
           </view>
-          <view class="skip-btn" @click="goStage2">跳过1</view>
+          <view class="skip-btn" @click="goStage2">跳过</view>
         </view>
       </view>
     </view>
@@ -461,6 +467,7 @@ export default {
   height: 70vh;
   max-width: 260px;
   max-height: 400px;
+  z-index: 9;
 }
 
 .corner {
@@ -526,7 +533,8 @@ export default {
   flex-direction: column;
   align-items: center;
   justify-content: space-between;
-  height: 50vh;
+  height: 30vh;
+  z-index: 9;
 }
 
 .count-box {
@@ -566,7 +574,7 @@ export default {
 
 .top-bar {
   position: absolute;
-  top: 0;
+  top: 80rpx;
   left: 0;
   right: 0;
   padding: 12px 18px;
